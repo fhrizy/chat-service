@@ -1,8 +1,7 @@
 import { Response, NextFunction } from 'express';
 import multer, { FileFilterCallback } from 'multer';
-import path from 'path';
-import fs from 'fs';
 import imageSize from 'image-size';
+import cloudinary from '../config/cloudinary';
 import { AuthRequest } from '../middlewares/auth';
 import { IAttachment } from '../models/Message';
 
@@ -28,25 +27,8 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024;
 // Maximum files per request
 const MAX_FILES = 5;
 
-// Upload directory
-const UPLOAD_DIR = path.resolve(__dirname, '../../uploads/chat');
-
-// Ensure upload directory exists
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-}
-
-// Multer disk storage configuration
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, UPLOAD_DIR);
-  },
-  filename: (_req, file, cb) => {
-    const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-    const ext = path.extname(file.originalname);
-    cb(null, `${uniqueSuffix}${ext}`);
-  },
-});
+// Use memory storage — files stay in buffer, uploaded directly to Cloudinary
+const storage = multer.memoryStorage();
 
 // File filter to validate MIME types
 const fileFilter = (
@@ -79,9 +61,38 @@ const upload = multer({
 export const uploadMiddleware = upload.array('files', MAX_FILES);
 
 /**
+ * Upload a single file buffer to Cloudinary.
+ * Returns the secure URL and public ID.
+ */
+async function uploadToCloudinary(
+  buffer: Buffer,
+  originalName: string,
+  mimeType: string
+): Promise<{ secure_url: string; public_id: string }> {
+  const isImage = IMAGE_MIME_TYPES.includes(mimeType);
+  const resourceType = isImage ? 'image' : 'raw';
+
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        folder: 'chat',
+        resource_type: resourceType,
+        public_id: `${Date.now()}-${originalName.replace(/\.[^/.]+$/, '')}`,
+        ...(isImage && { transformation: [{ quality: 'auto', fetch_format: 'auto' }] }),
+      },
+      (error, result) => {
+        if (error) reject(error);
+        else resolve(result as { secure_url: string; public_id: string });
+      }
+    );
+    uploadStream.end(buffer);
+  });
+}
+
+/**
  * POST /api/chat/upload
  * Upload up to 5 files (max 10MB each).
- * Returns array of attachment metadata.
+ * Returns array of attachment metadata with Cloudinary URLs.
  */
 export async function uploadFiles(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -100,8 +111,7 @@ export async function uploadFiles(req: AuthRequest, res: Response): Promise<void
 
         if (isImage) {
           try {
-            const buffer = fs.readFileSync(file.path);
-            const dimensions = imageSize(buffer);
+            const dimensions = imageSize(file.buffer);
             width = dimensions.width;
             height = dimensions.height;
           } catch {
@@ -109,8 +119,11 @@ export async function uploadFiles(req: AuthRequest, res: Response): Promise<void
           }
         }
 
+        // Upload to Cloudinary
+        const result = await uploadToCloudinary(file.buffer, file.originalname, file.mimetype);
+
         const attachment: IAttachment = {
-          url: `/uploads/chat/${file.filename}`,
+          url: result.secure_url,
           fileName: file.originalname,
           fileSize: file.size,
           mimeType: file.mimetype,
@@ -125,7 +138,8 @@ export async function uploadFiles(req: AuthRequest, res: Response): Promise<void
 
     res.status(200).json({ attachments });
   } catch (error) {
-    res.status(500).json({ message: 'Internal server error' });
+    console.error('Cloudinary upload error:', error);
+    res.status(500).json({ message: 'Failed to upload files' });
   }
 }
 
